@@ -1,14 +1,19 @@
 use axum::{
+    body::Bytes,
     extract::Query,
     http::{
-        header::{self, HeaderMap},
+        header::{self, HeaderMap, CONTENT_TYPE},
         StatusCode,
     },
-    routing::get,
+    routing::{get, post},
     Router,
 };
+use cargo_manifest::{Manifest, MaybeInherited};
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use serde_yaml::Value as YamlValue;
 use std::ops::BitXor;
+use toml;
 
 #[derive(Deserialize)]
 struct Addresses {
@@ -145,6 +150,134 @@ async fn calc_ipv6_key_address(addresses: Query<Addresses2>) -> String {
     key_address
 }
 
+async fn parse_manifest(headers: HeaderMap, body: Bytes) -> (StatusCode, String) {
+    let content_type_header = headers.get(CONTENT_TYPE);
+    let content_type = match content_type_header {
+        Some(content_type_header) => content_type_header,
+        None => return (StatusCode::UNSUPPORTED_MEDIA_TYPE, String::new()),
+    };
+
+    let toml_str = if content_type == "application/json" {
+        // JSONをTOMLに変換
+        let json_value: JsonValue = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return (StatusCode::BAD_REQUEST, "Invalid JSON".to_string()),
+        };
+        match toml::to_string_pretty(&json_value) {
+            Ok(s) => s,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to convert JSON to TOML".to_string(),
+                )
+            }
+        }
+    } else if content_type == "application/yaml" {
+        // YAMLをTOMLに変換
+        let yaml_value: YamlValue = match serde_yaml::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return (StatusCode::BAD_REQUEST, "Invalid YAML".to_string()),
+        };
+        match toml::to_string_pretty(&yaml_value) {
+            Ok(s) => s,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    "Failed to convert YAML to TOML".to_string(),
+                )
+            }
+        }
+    } else if content_type == "application/toml" {
+        match String::from_utf8(body.to_vec()) {
+            Ok(s) => s,
+            Err(_) => return (StatusCode::BAD_REQUEST, "Invalid TOML".to_string()),
+        }
+    } else {
+        return (StatusCode::UNSUPPORTED_MEDIA_TYPE, String::new());
+    };
+
+    let manifest = match Manifest::from_slice(toml_str.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid manifest".to_string()),
+    };
+
+    let package = match manifest.package {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Magic keyword not provided".to_string(),
+            )
+        }
+    };
+
+    let keywords = match package.keywords {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Magic keyword not provided".to_string(),
+            )
+        }
+    };
+
+    let keywords = match keywords {
+        MaybeInherited::Inherited { .. } => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Magic keyword not provided".to_string(),
+            )
+        }
+        MaybeInherited::Local(k) => k,
+    };
+
+    if !keywords.contains(&"Christmas 2024".to_string()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Magic keyword not provided".to_string(),
+        );
+    }
+
+    let metadata = match package.metadata {
+        Some(m) => m,
+        None => return (StatusCode::NO_CONTENT, String::new()),
+    };
+
+    let orders = match metadata.get("orders") {
+        Some(o) => o,
+        None => return (StatusCode::NO_CONTENT, String::new()),
+    };
+    let orders = match orders.as_array() {
+        Some(o) => o,
+        None => return (StatusCode::NO_CONTENT, String::new()),
+    };
+
+    let mut outputs = Vec::new();
+    for order in orders {
+        let item = match order.get("item") {
+            Some(i) => i,
+            None => continue,
+        };
+        let quantity = match order.get("quantity") {
+            Some(q) => q,
+            None => continue,
+        };
+        let item = match item.as_str() {
+            Some(i) => i,
+            None => continue,
+        };
+        let quantity = match quantity.as_integer() {
+            Some(q) => q,
+            None => continue,
+        };
+        outputs.push(format!("{}: {}", item, quantity));
+    }
+    if outputs.is_empty() {
+        return (StatusCode::NO_CONTENT, String::new());
+    }
+    (StatusCode::OK, outputs.join("\n"))
+}
+
 #[shuttle_runtime::main]
 async fn main() -> shuttle_axum::ShuttleAxum {
     let router = Router::new()
@@ -153,6 +286,7 @@ async fn main() -> shuttle_axum::ShuttleAxum {
         .route("/2/dest", get(calc_dest_address))
         .route("/2/key", get(calc_key_address))
         .route("/2/v6/dest", get(calc_ipv6_dest_address))
-        .route("/2/v6/key", get(calc_ipv6_key_address));
+        .route("/2/v6/key", get(calc_ipv6_key_address))
+        .route("/5/manifest", post(parse_manifest));
     Ok(router.into())
 }

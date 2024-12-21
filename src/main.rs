@@ -1,19 +1,27 @@
 use axum::{
     body::Bytes,
-    extract::Query,
+    extract::{rejection::JsonRejection, Json, Query, State},
     http::{
         header::{self, HeaderMap, CONTENT_TYPE},
-        StatusCode,
+        HeaderValue, StatusCode,
     },
     routing::{get, post},
     Router,
 };
 use cargo_manifest::{Manifest, MaybeInherited};
-use serde::Deserialize;
+use leaky_bucket::RateLimiter;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
-use std::ops::BitXor;
+use std::{
+    ops::BitXor,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use toml;
+
+const BUCKET_SIZE: usize = 5;
+const REFILL_INTERVAL: u64 = 1;
 
 #[derive(Deserialize)]
 struct Addresses {
@@ -25,6 +33,11 @@ struct Addresses {
 struct Addresses2 {
     from: String,
     to: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+    limiter: Arc<Mutex<RateLimiter>>,
 }
 
 async fn hello_world() -> &'static str {
@@ -278,8 +291,71 @@ async fn parse_manifest(headers: HeaderMap, body: Bytes) -> (StatusCode, String)
     (StatusCode::OK, outputs.join("\n"))
 }
 
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "lowercase")]
+enum Volume {
+    Gallons(f32),
+    Liters(f32),
+    Pints(f32),
+    Litres(f32),
+}
+
+async fn withdraw_milk(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    volume: Result<Json<Volume>, JsonRejection>,
+) -> (StatusCode, String) {
+    let limiter = state.limiter.lock().unwrap();
+    let success = limiter.try_acquire(1);
+    if !success {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "No milk available\n".to_string(),
+        );
+    }
+    let content_type_header = headers.get(CONTENT_TYPE);
+    let is_json = content_type_header == Some(&HeaderValue::from_static("application/json"));
+    if is_json {
+        let Json(volume) = match volume {
+            Ok(v) => v,
+            Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
+        };
+        let volume = match volume {
+            Volume::Gallons(v) => Volume::Liters(v * 3.785411784),
+            Volume::Liters(v) => Volume::Gallons(v / 3.785411784),
+            Volume::Pints(v) => Volume::Litres(v * 0.56826125),
+            Volume::Litres(v) => Volume::Pints(v / 0.56826125),
+        };
+        // JSONに変換
+        let json_value = serde_json::to_value(volume).unwrap();
+        return (StatusCode::OK, json_value.to_string());
+    } else {
+        (StatusCode::OK, "Milk withdrawn\n".to_string())
+    }
+}
+
+async fn refill_milk(State(state): State<AppState>) -> (StatusCode, String) {
+    let mut limiter = state.limiter.lock().unwrap();
+    *limiter = RateLimiter::builder()
+        .initial(BUCKET_SIZE)
+        .max(BUCKET_SIZE)
+        .interval(Duration::from_secs(REFILL_INTERVAL))
+        .build();
+    (StatusCode::OK, String::new())
+}
+
 #[shuttle_runtime::main]
 async fn main() -> shuttle_axum::ShuttleAxum {
+    let state = AppState {
+        limiter: Arc::new(Mutex::new(
+            RateLimiter::builder()
+                .initial(BUCKET_SIZE)
+                .max(BUCKET_SIZE)
+                .interval(Duration::from_secs(REFILL_INTERVAL))
+                .build(),
+        )),
+    };
+
     let router = Router::new()
         .route("/", get(hello_world))
         .route("/-1/seek", get(seek))
@@ -287,6 +363,9 @@ async fn main() -> shuttle_axum::ShuttleAxum {
         .route("/2/key", get(calc_key_address))
         .route("/2/v6/dest", get(calc_ipv6_dest_address))
         .route("/2/v6/key", get(calc_ipv6_key_address))
-        .route("/5/manifest", post(parse_manifest));
+        .route("/5/manifest", post(parse_manifest))
+        .route("/9/milk", post(withdraw_milk))
+        .route("/9/refill", post(refill_milk))
+        .with_state(state);
     Ok(router.into())
 }

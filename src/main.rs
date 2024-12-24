@@ -1,6 +1,6 @@
 use axum::{
     body::Bytes,
-    extract::{rejection::JsonRejection, Json, Query, State},
+    extract::{rejection::JsonRejection, Json, Path, Query, State},
     http::{
         header::{self, HeaderMap, CONTENT_TYPE},
         HeaderValue, StatusCode,
@@ -10,10 +10,12 @@ use axum::{
 };
 use cargo_manifest::{Manifest, MaybeInherited};
 use leaky_bucket::RateLimiter;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 use std::{
+    fmt::Display,
     ops::BitXor,
     sync::{Arc, Mutex},
     time::Duration,
@@ -35,9 +37,136 @@ struct Addresses2 {
     to: String,
 }
 
+#[derive(Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum Team {
+    Cookie,
+    Milk,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Board {
+    board: [[Option<Team>; 4]; 4],
+}
+
+impl Display for Board {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut output = String::new();
+        for i in 0..4 {
+            output.push_str("⬜");
+            for j in 0..4 {
+                match self.board[j][i] {
+                    Some(Team::Cookie) => output.push_str("🍪"),
+                    Some(Team::Milk) => output.push_str("🥛"),
+                    None => output.push_str("⬛"),
+                }
+            }
+            output.push_str("⬜\n");
+        }
+        output.push_str("⬜⬜⬜⬜⬜⬜\n");
+        write!(f, "{}", output)
+    }
+}
+
+impl Board {
+    fn check_winner(&self) -> Option<Team> {
+        // 縦横のチェック
+        for i in 0..4 {
+            // 横のチェック
+            if let Some(team) = self.board[i][0] {
+                if self.board[i][1] == Some(team)
+                    && self.board[i][2] == Some(team)
+                    && self.board[i][3] == Some(team)
+                {
+                    return Some(team);
+                }
+            }
+            // 縦のチェック
+            if let Some(team) = self.board[0][i] {
+                if self.board[1][i] == Some(team)
+                    && self.board[2][i] == Some(team)
+                    && self.board[3][i] == Some(team)
+                {
+                    return Some(team);
+                }
+            }
+        }
+
+        // 斜めのチェック（左上から右下）
+        if let Some(team) = self.board[0][0] {
+            if self.board[1][1] == Some(team)
+                && self.board[2][2] == Some(team)
+                && self.board[3][3] == Some(team)
+            {
+                return Some(team);
+            }
+        }
+
+        // 斜めのチェック（右上から左下）
+        if let Some(team) = self.board[0][3] {
+            if self.board[1][2] == Some(team)
+                && self.board[2][1] == Some(team)
+                && self.board[3][0] == Some(team)
+            {
+                return Some(team);
+            }
+        }
+
+        None
+    }
+
+    fn is_draw(&self) -> bool {
+        // すべてのマスが埋まっているかチェック
+        for row in self.board.iter() {
+            for cell in row.iter() {
+                if cell.is_none() {
+                    return false;
+                }
+            }
+        }
+        // 勝者がいない場合は引き分け
+        self.check_winner().is_none()
+    }
+
+    fn show_result(&self) -> Option<String> {
+        let mut result = self.to_string();
+        if let Some(winner) = self.check_winner() {
+            result.push_str(&format!(
+                "{} wins!\n",
+                match winner {
+                    Team::Cookie => "🍪",
+                    Team::Milk => "🥛",
+                }
+            ));
+            Some(result)
+        } else if self.is_draw() {
+            result.push_str("No winner.\n");
+            Some(result)
+        } else {
+            None
+        }
+    }
+
+    fn generate_random(rng: &mut rand::rngs::StdRng) -> Self {
+        let mut board = Board::default();
+        for i in 0..4 {
+            for j in 0..4 {
+                board.board[j][i] = Some(if rng.gen::<bool>() {
+                    Team::Cookie
+                } else {
+                    Team::Milk
+                });
+            }
+        }
+        board
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     limiter: Arc<Mutex<RateLimiter>>,
+    board: Arc<Mutex<Board>>,
+    rng: Arc<Mutex<rand::rngs::StdRng>>,
 }
 
 async fn hello_world() -> &'static str {
@@ -344,6 +473,75 @@ async fn refill_milk(State(state): State<AppState>) -> (StatusCode, String) {
     (StatusCode::OK, String::new())
 }
 
+async fn get_board(State(state): State<AppState>) -> (StatusCode, String) {
+    let board = state.board.lock().unwrap();
+    if let Some(result) = board.show_result() {
+        (StatusCode::OK, result)
+    } else {
+        (StatusCode::OK, format!("{}", board))
+    }
+}
+
+async fn reset_board(State(state): State<AppState>) -> (StatusCode, String) {
+    let mut board = state.board.lock().unwrap();
+    *board = Board::default();
+    let mut rng = state.rng.lock().unwrap();
+    *rng = rand::rngs::StdRng::seed_from_u64(2024);
+    (StatusCode::OK, format!("{}", board))
+}
+
+async fn place_piece(
+    State(state): State<AppState>,
+    Path((team, column)): Path<(Team, usize)>,
+) -> (StatusCode, String) {
+    if column < 1 || 4 < column {
+        return (StatusCode::BAD_REQUEST, "Invalid column".to_string());
+    }
+    let mut board = state.board.lock().unwrap();
+    let result = board.show_result();
+    if let Some(result) = result {
+        return (StatusCode::SERVICE_UNAVAILABLE, result);
+    }
+
+    let column = column - 1;
+    // 下から順に空いている場所を探す
+    for row in (0..4).rev() {
+        if board.board[column][row].is_none() {
+            board.board[column][row] = Some(team);
+            let result = board.show_result();
+            if let Some(result) = result {
+                return (StatusCode::OK, result);
+            }
+            return (StatusCode::OK, format!("{}", board));
+        }
+    }
+
+    (StatusCode::SERVICE_UNAVAILABLE, format!("{}", board))
+}
+
+async fn random_board(State(state): State<AppState>) -> (StatusCode, String) {
+    let mut rng = state.rng.lock().unwrap();
+    let board = Board::generate_random(&mut rng);
+    let result = board.to_string();
+    if let Some(winner) = board.check_winner() {
+        (
+            StatusCode::OK,
+            format!(
+                "{}{} wins!",
+                result,
+                match winner {
+                    Team::Cookie => "🍪",
+                    Team::Milk => "🥛",
+                }
+            ),
+        )
+    } else if board.is_draw() {
+        (StatusCode::OK, format!("{}No winner.", result))
+    } else {
+        (StatusCode::OK, result)
+    }
+}
+
 #[shuttle_runtime::main]
 async fn main() -> shuttle_axum::ShuttleAxum {
     let state = AppState {
@@ -354,6 +552,8 @@ async fn main() -> shuttle_axum::ShuttleAxum {
                 .interval(Duration::from_secs(REFILL_INTERVAL))
                 .build(),
         )),
+        board: Arc::new(Mutex::new(Board::default())),
+        rng: Arc::new(Mutex::new(rand::rngs::StdRng::seed_from_u64(2024))),
     };
 
     let router = Router::new()
@@ -366,6 +566,10 @@ async fn main() -> shuttle_axum::ShuttleAxum {
         .route("/5/manifest", post(parse_manifest))
         .route("/9/milk", post(withdraw_milk))
         .route("/9/refill", post(refill_milk))
+        .route("/12/board", get(get_board))
+        .route("/12/reset", post(reset_board))
+        .route("/12/place/:team/:column", post(place_piece))
+        .route("/12/random-board", get(random_board))
         .with_state(state);
     Ok(router.into())
 }

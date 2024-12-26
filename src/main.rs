@@ -5,10 +5,11 @@ use axum::{
         header::{self, HeaderMap, CONTENT_TYPE},
         HeaderValue, StatusCode,
     },
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use cargo_manifest::{Manifest, MaybeInherited};
+use chrono::{DateTime, Utc};
 use jsonwebtoken::{
     decode, decode_header, encode, errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header,
     Validation,
@@ -21,12 +22,14 @@ use serde_yaml::Value as YamlValue;
 use shuttle_runtime::SecretStore;
 use std::sync::OnceLock;
 use std::{
+    collections::HashMap,
     fmt::Display,
     ops::BitXor,
     sync::{Arc, Mutex},
     time::Duration,
 };
 use toml;
+use uuid::Uuid;
 
 const BUCKET_SIZE: usize = 5;
 const REFILL_INTERVAL: u64 = 1;
@@ -175,11 +178,40 @@ impl Board {
     }
 }
 
+#[derive(sqlx::FromRow, Serialize)]
+struct Quote {
+    id: Uuid,
+    author: String,
+    quote: String,
+    created_at: DateTime<Utc>,
+    version: i32,
+}
+
+#[derive(Deserialize)]
+struct Draft {
+    author: String,
+    quote: String,
+}
+
+#[derive(Serialize)]
+struct QuoteList {
+    quotes: Vec<Quote>,
+    page: i32,
+    next_token: Option<String>,
+}
+
+#[derive(Clone)]
+struct PaginationState {
+    page: i32,
+}
+
 #[derive(Clone)]
 struct AppState {
     limiter: Arc<Mutex<RateLimiter>>,
     board: Arc<Mutex<Board>>,
     rng: Arc<Mutex<rand::rngs::StdRng>>,
+    pool: sqlx::PgPool,
+    pagination_tokens: Arc<Mutex<HashMap<String, PaginationState>>>,
 }
 
 async fn hello_world() -> &'static str {
@@ -647,8 +679,173 @@ async fn decode_gift(body: String) -> Result<Json<JsonValue>, StatusCode> {
     Ok(Json(token_data.claims.data))
 }
 
+async fn reset_quotes(State(state): State<AppState>) -> (StatusCode, String) {
+    sqlx::query("DELETE FROM quotes")
+        .execute(&state.pool)
+        .await
+        .expect("Failed to reset quotes");
+    (StatusCode::OK, "Quotes reset".to_string())
+}
+
+async fn get_quotes(State(state): State<AppState>, Path(id): Path<Uuid>) -> (StatusCode, String) {
+    let quote = sqlx::query_as::<_, Quote>("SELECT * FROM quotes WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+    if let Some(quote) = quote {
+        (StatusCode::OK, serde_json::to_string(&quote).unwrap())
+    } else {
+        (StatusCode::NOT_FOUND, "Quote not found".to_string())
+    }
+}
+
+async fn remove_quotes(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> (StatusCode, String) {
+    let quote = sqlx::query_as::<_, Quote>("SELECT * FROM quotes WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+    if let Some(quote) = quote {
+        sqlx::query("DELETE FROM quotes WHERE id = $1")
+            .bind(id)
+            .execute(&state.pool)
+            .await
+            .expect("Failed to remove quote");
+        (StatusCode::OK, serde_json::to_string(&quote).unwrap())
+    } else {
+        (StatusCode::NOT_FOUND, "Quote not found".to_string())
+    }
+}
+
+async fn undo_quotes(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(draft): Json<Draft>,
+) -> (StatusCode, String) {
+    let quote = sqlx::query_as::<_, Quote>("SELECT * FROM quotes WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+    if let Some(mut quote) = quote {
+        quote.quote = draft.quote;
+        quote.author = draft.author;
+        quote.version += 1;
+        sqlx::query(
+            "UPDATE quotes SET quote = $1, author = $2, version = version + 1 WHERE id = $3",
+        )
+        .bind(&quote.quote)
+        .bind(&quote.author)
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .expect("Failed to undo quote");
+        (StatusCode::OK, serde_json::to_string(&quote).unwrap())
+    } else {
+        return (StatusCode::NOT_FOUND, "Quote not found".to_string());
+    }
+}
+
+async fn add_quote(
+    State(state): State<AppState>,
+    Json(draft): Json<Draft>,
+) -> (StatusCode, String) {
+    let quote = sqlx::query_as::<_, Quote>(
+        "INSERT INTO quotes (quote, author) VALUES ($1, $2) RETURNING id, author, quote, created_at, version",
+    )
+    .bind(draft.quote)
+    .bind(draft.author)
+    .fetch_one(&state.pool)
+    .await
+    .expect("Failed to add quote");
+    (StatusCode::CREATED, serde_json::to_string(&quote).unwrap())
+}
+
+fn generate_token(rng: &mut rand::rngs::StdRng) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut token = String::with_capacity(16);
+    for _ in 0..16 {
+        let idx = rng.gen_range(0..CHARSET.len());
+        token.push(CHARSET[idx] as char);
+    }
+    token
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    token: String,
+}
+
+async fn list_quotes(
+    State(state): State<AppState>,
+    query: Option<Query<ListQuery>>,
+) -> Result<Json<QuoteList>, StatusCode> {
+    const QUOTES_PER_PAGE: i64 = 3;
+
+    let current_page = if let Some(query) = query {
+        let tokens = state.pagination_tokens.lock().unwrap();
+        if let Some(pagination_state) = tokens.get(&query.token) {
+            pagination_state.page
+        } else {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    } else {
+        1
+    };
+
+    let offset = (current_page - 1) * QUOTES_PER_PAGE as i32;
+
+    let quotes = sqlx::query_as::<_, Quote>(
+        "SELECT * FROM quotes ORDER BY created_at ASC LIMIT $1 OFFSET $2",
+    )
+    .bind(QUOTES_PER_PAGE + 1) // 次のページがあるかチェックするために1つ多く取得
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let has_next_page = quotes.len() > QUOTES_PER_PAGE as usize;
+    let quotes = quotes
+        .into_iter()
+        .take(QUOTES_PER_PAGE as usize)
+        .collect::<Vec<_>>();
+
+    let next_token = if has_next_page {
+        let mut rng = state.rng.lock().unwrap();
+        let token = generate_token(&mut rng);
+        let mut tokens = state.pagination_tokens.lock().unwrap();
+        tokens.insert(
+            token.clone(),
+            PaginationState {
+                page: current_page + 1,
+            },
+        );
+        Some(token)
+    } else {
+        None
+    };
+
+    Ok(Json(QuoteList {
+        quotes,
+        page: current_page,
+        next_token,
+    }))
+}
+
 #[shuttle_runtime::main]
-async fn main(#[shuttle_runtime::Secrets] secrets: SecretStore) -> shuttle_axum::ShuttleAxum {
+async fn main(
+    #[shuttle_runtime::Secrets] secrets: SecretStore,
+    #[shuttle_shared_db::Postgres] pool: sqlx::PgPool,
+) -> shuttle_axum::ShuttleAxum {
+    sqlx::migrate!()
+        .run(&pool)
+        .await
+        .expect("Failed to run migrations");
+
     HEADER.set(Header::new(ALGORITHM)).unwrap();
     SECRET_KEY.set(secrets.get("SECRET_KEY").unwrap()).unwrap();
     PUBLIC_KEY.set(secrets.get("PUBLIC_KEY").unwrap()).unwrap();
@@ -666,6 +863,8 @@ async fn main(#[shuttle_runtime::Secrets] secrets: SecretStore) -> shuttle_axum:
         )),
         board: Arc::new(Mutex::new(Board::default())),
         rng: Arc::new(Mutex::new(rand::rngs::StdRng::seed_from_u64(2024))),
+        pool,
+        pagination_tokens: Arc::new(Mutex::new(HashMap::new())),
     };
 
     let router = Router::new()
@@ -685,6 +884,12 @@ async fn main(#[shuttle_runtime::Secrets] secrets: SecretStore) -> shuttle_axum:
         .route("/16/wrap", post(wrap_gift))
         .route("/16/unwrap", get(unwrap_gift))
         .route("/16/decode", post(decode_gift))
+        .route("/19/reset", post(reset_quotes))
+        .route("/19/cite/:id", get(get_quotes))
+        .route("/19/remove/:id", delete(remove_quotes))
+        .route("/19/undo/:id", put(undo_quotes))
+        .route("/19/draft", post(add_quote))
+        .route("/19/list", get(list_quotes))
         .with_state(state);
     Ok(router.into())
 }

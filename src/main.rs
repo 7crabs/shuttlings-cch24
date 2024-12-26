@@ -9,11 +9,17 @@ use axum::{
     Router,
 };
 use cargo_manifest::{Manifest, MaybeInherited};
+use jsonwebtoken::{
+    decode, decode_header, encode, errors::ErrorKind, Algorithm, DecodingKey, EncodingKey, Header,
+    Validation,
+};
 use leaky_bucket::RateLimiter;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
+use shuttle_runtime::SecretStore;
+use std::sync::OnceLock;
 use std::{
     fmt::Display,
     ops::BitXor,
@@ -24,6 +30,13 @@ use toml;
 
 const BUCKET_SIZE: usize = 5;
 const REFILL_INTERVAL: u64 = 1;
+
+static SECRET_KEY: OnceLock<String> = OnceLock::new();
+static PUBLIC_KEY: OnceLock<String> = OnceLock::new();
+static SANTA_PUBLIC_KEY: OnceLock<String> = OnceLock::new();
+const ALGORITHM: Algorithm = Algorithm::EdDSA;
+
+static HEADER: OnceLock<Header> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct Addresses {
@@ -504,7 +517,7 @@ async fn place_piece(
     }
 
     let column = column - 1;
-    // 下から順に空いている場所を探す
+    // 下から順いている場所を探す
     for row in (0..4).rev() {
         if board.board[column][row].is_none() {
             board.board[column][row] = Some(team);
@@ -542,8 +555,107 @@ async fn random_board(State(state): State<AppState>) -> (StatusCode, String) {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    #[serde(flatten)]
+    data: JsonValue,
+}
+
+async fn wrap_gift(Json(data): Json<JsonValue>) -> (StatusCode, HeaderMap, &'static str) {
+    let header = HEADER.get_or_init(|| Header::new(ALGORITHM));
+    let claims = Claims { data };
+
+    let secret_key = SECRET_KEY.get().unwrap();
+    let token = encode(
+        header,
+        &claims,
+        &EncodingKey::from_ed_pem(secret_key.as_bytes()).unwrap(),
+    )
+    .unwrap();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&format!("gift={}", token)).unwrap(),
+    );
+
+    (StatusCode::OK, headers, "")
+}
+
+async fn unwrap_gift(headers: HeaderMap) -> Result<Json<JsonValue>, StatusCode> {
+    let cookie_header = match headers.get(header::COOKIE) {
+        Some(cookie_header) => cookie_header,
+        None => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let cookie_str = match cookie_header.to_str() {
+        Ok(s) => s,
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let gift_token = cookie_str
+        .split(';')
+        .find(|s| s.trim().starts_with("gift="))
+        .map(|s| s.trim()[5..].to_string())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+
+    let mut validation = Validation::new(ALGORITHM);
+    validation.required_spec_claims.remove("exp");
+
+    let token_data = decode::<Claims>(
+        &gift_token,
+        &DecodingKey::from_ed_pem(PUBLIC_KEY.get().unwrap().as_bytes()).unwrap(),
+        &validation,
+    )
+    .map_err(|e| {
+        println!("JWT decode error: {:?}", e);
+        StatusCode::BAD_REQUEST
+    })?;
+
+    Ok(Json(token_data.claims.data))
+}
+
+async fn decode_gift(body: String) -> Result<Json<JsonValue>, StatusCode> {
+    // 公開鍵をSANTA_PUBLIC_KEYから取得
+    let public_key = SANTA_PUBLIC_KEY.get().unwrap();
+
+    // JWTのヘッダーをデコードしてアルゴリズムを取得
+    let header: Header = decode_header(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let algorithm = match header.alg {
+        Algorithm::RS256 | Algorithm::RS512 => header.alg,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    // Validationの設定を修正
+    let mut validation = Validation::new(algorithm);
+    validation.required_spec_claims.remove("exp"); // expの検証を無効化
+
+    // JWTのデコード（署名の検証を有効化）
+    let token_data = decode::<Claims>(
+        &body,
+        &DecodingKey::from_rsa_pem(public_key.as_bytes()).map_err(|_| StatusCode::BAD_REQUEST)?,
+        &validation,
+    )
+    .map_err(|e| {
+        match *e.kind() {
+            ErrorKind::InvalidToken => StatusCode::BAD_REQUEST, // ヘッダーが無効な場合
+            ErrorKind::InvalidSignature => StatusCode::UNAUTHORIZED, // 署名が無効な場合
+            _ => StatusCode::BAD_REQUEST,                       // その他の理由で無効な場合
+        }
+    })?;
+
+    Ok(Json(token_data.claims.data))
+}
+
 #[shuttle_runtime::main]
-async fn main() -> shuttle_axum::ShuttleAxum {
+async fn main(#[shuttle_runtime::Secrets] secrets: SecretStore) -> shuttle_axum::ShuttleAxum {
+    HEADER.set(Header::new(ALGORITHM)).unwrap();
+    SECRET_KEY.set(secrets.get("SECRET_KEY").unwrap()).unwrap();
+    PUBLIC_KEY.set(secrets.get("PUBLIC_KEY").unwrap()).unwrap();
+    SANTA_PUBLIC_KEY
+        .set(secrets.get("SANTA_PUBLIC_KEY").unwrap())
+        .unwrap();
+
     let state = AppState {
         limiter: Arc::new(Mutex::new(
             RateLimiter::builder()
@@ -570,6 +682,9 @@ async fn main() -> shuttle_axum::ShuttleAxum {
         .route("/12/reset", post(reset_board))
         .route("/12/place/:team/:column", post(place_piece))
         .route("/12/random-board", get(random_board))
+        .route("/16/wrap", post(wrap_gift))
+        .route("/16/unwrap", get(unwrap_gift))
+        .route("/16/decode", post(decode_gift))
         .with_state(state);
     Ok(router.into())
 }

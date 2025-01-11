@@ -1,10 +1,11 @@
 use axum::{
     body::Bytes,
-    extract::{rejection::JsonRejection, Json, Path, Query, State},
+    extract::{rejection::JsonRejection, Json, Multipart, Path, Query, State},
     http::{
         header::{self, HeaderMap, CONTENT_TYPE},
         HeaderValue, StatusCode,
     },
+    response::Html,
     routing::{delete, get, post, put},
     Router,
 };
@@ -29,6 +30,7 @@ use std::{
     time::Duration,
 };
 use toml;
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 const BUCKET_SIZE: usize = 5;
@@ -836,6 +838,138 @@ async fn list_quotes(
     }))
 }
 
+async fn get_light_star() -> Html<&'static str> {
+    Html("<div id=\"star\" class=\"lit\"></div>")
+}
+
+async fn get_present(Path(color): Path<String>) -> (StatusCode, Html<&'static str>) {
+    match color.as_str() {
+        "red" => (
+            StatusCode::OK,
+            Html(
+                "<div class=\"present red\" hx-get=\"/23/present/blue\" hx-swap=\"outerHTML\">
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                </div>",
+            ),
+        ),
+        "blue" => (
+            StatusCode::OK,
+            Html(
+                "<div class=\"present blue\" hx-get=\"/23/present/purple\" hx-swap=\"outerHTML\">
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                </div>",
+            ),
+        ),
+        "purple" => (
+            StatusCode::OK,
+            Html(
+                "<div class=\"present purple\" hx-get=\"/23/present/red\" hx-swap=\"outerHTML\">
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                    <div class=\"ribbon\"></div>
+                </div>",
+            ),
+        ),
+        _ => (StatusCode::IM_A_TEAPOT, Html("")),
+    }
+}
+
+async fn get_ornament(Path((state, n)): Path<(String, String)>) -> (StatusCode, Html<String>) {
+    let n = html_escape::encode_double_quoted_attribute(&n);
+    match state.as_str() {
+        "on" => (
+            StatusCode::OK,
+            Html(format!(
+                "<div class=\"ornament on\" id=\"ornament{}\" hx-trigger=\"load delay:2s once\" hx-get=\"/23/ornament/off/{}\" hx-swap=\"outerHTML\"></div>",
+                n, n
+            )),
+        ),
+        "off" => (
+            StatusCode::OK,
+            Html(format!(
+                "<div class=\"ornament\" id=\"ornament{}\" hx-trigger=\"load delay:2s once\" hx-get=\"/23/ornament/on/{}\" hx-swap=\"outerHTML\"></div>",
+                n, n
+            )),
+        ),
+        _ => (StatusCode::IM_A_TEAPOT, Html("".to_string())),
+    }
+}
+
+async fn process_lockfile(mut multipart: Multipart) -> Result<Html<String>, StatusCode> {
+    let mut lockfile_content = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
+        if field.name() == Some("lockfile") {
+            lockfile_content = Some(field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?);
+        }
+    }
+
+    let lockfile_content = lockfile_content.ok_or(StatusCode::BAD_REQUEST)?;
+
+    // TOMLとしてパース
+    let lockfile: toml::Value = match toml::from_str(&lockfile_content) {
+        Ok(l) => l,
+        _ => {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    // packagesを取得
+    let packages = match lockfile.get("package") {
+        Some(toml::Value::Array(packages)) => packages,
+        _ => {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    let mut html = String::new();
+    for package in packages.iter() {
+        if let Some(checksum) = package.get("checksum") {
+            let checksum = match checksum {
+                toml::Value::String(s) => s,
+                _ => {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+            };
+
+            // チェックサムは少なくとも5バイト（10文字）必要で、16進数文字列である必要がある
+            if checksum.len() < 10 || !checksum.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(StatusCode::UNPROCESSABLE_ENTITY);
+            }
+
+            // 最初の6文字を色コードとして使用
+            let color = &checksum[..6];
+            // 次の2文字をtopとして使用
+            let top = u8::from_str_radix(&checksum[6..8], 16)
+                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+            // その次の2文字をleftとして使用
+            let left = u8::from_str_radix(&checksum[8..10], 16)
+                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
+
+            if !html.is_empty() {
+                html.push('\n');
+            }
+            html.push_str(&format!(
+                "<div style=\"background-color:#{};top:{}px;left:{}px;\"></div>",
+                color, top, left
+            ));
+        }
+    }
+
+    Ok(Html(html))
+}
+
 #[shuttle_runtime::main]
 async fn main(
     #[shuttle_runtime::Secrets] secrets: SecretStore,
@@ -890,6 +1024,11 @@ async fn main(
         .route("/19/undo/:id", put(undo_quotes))
         .route("/19/draft", post(add_quote))
         .route("/19/list", get(list_quotes))
+        .route("/23/star", get(get_light_star))
+        .route("/23/present/:color", get(get_present))
+        .route("/23/ornament/:state/:n", get(get_ornament))
+        .route("/23/lockfile", post(process_lockfile))
+        .nest_service("/assets", ServeDir::new("assets"))
         .with_state(state);
     Ok(router.into())
 }
